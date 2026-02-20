@@ -1,0 +1,658 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  LaunchDarkly-controlled pipeline routing with Universal Lambda Gate pattern.
+  Use Case 1: Pipeline version routing (v1 vs v2) via LD flag targeting.
+  Use Case 2: Regulated vs unregulated stage gating via Lambda Invoke actions.
+
+  Gated stages use a two-action pattern: Gate Lambda (RunOrder 1) evaluates the LD
+  flag, StageWorker Lambda (RunOrder 2) executes or no-ops based on the gate decision.
+  Non-gated stages use a single StageWorker Lambda action.
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  LDLayerArn:
+    Type: String
+    Description: ARN of a Lambda Layer containing the launchdarkly-server-sdk package.
+
+  LDSecretName:
+    Type: String
+    Description: Name of the Secrets Manager secret holding the LD SDK key.
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # ===========================================================================
+  # S3 ARTIFACT BUCKET
+  # ===========================================================================
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+
+  # ===========================================================================
+  # IAM ROLES
+  # ===========================================================================
+
+  RouterLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-router-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RouterPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${LDSecretName}-*"
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource:
+                  - !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-v1"
+                  - !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-v2"
+
+  GateLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-gate-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GatePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${LDSecretName}-*"
+              - Effect: Allow
+                Action:
+                  - codepipeline:PutJobSuccessResult
+                  - codepipeline:PutJobFailureResult
+                Resource: "*"
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-pipeline-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PipelinePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt GateLambda.Arn
+                  - !GetAtt StageWorkerLambda.Arn
+
+  # ===========================================================================
+  # ROUTER LAMBDA — Evaluates pipeline-version flag, starts CodePipeline
+  # ===========================================================================
+
+  RouterLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-router"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt RouterLambdaRole.Arn
+      Layers:
+        - !Ref LDLayerArn
+      Environment:
+        Variables:
+          LD_SECRET_NAME: !Ref LDSecretName
+          PIPELINE_V1_NAME: !Sub "${AWS::StackName}-v1"
+          PIPELINE_V2_NAME: !Sub "${AWS::StackName}-v2"
+      Code:
+        ZipFile: |
+          import json, os, uuid, boto3, ldclient
+          from ldclient import Context
+          from ldclient.config import Config
+
+          REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+          V1 = os.environ["PIPELINE_V1_NAME"]
+          V2 = os.environ["PIPELINE_V2_NAME"]
+          PIPELINE_MAP = {"v1": V1, "v2": V2}
+
+          cp = boto3.client("codepipeline", region_name=REGION)
+          sec = boto3.client("secretsmanager", region_name=REGION)
+          key = json.loads(sec.get_secret_value(SecretId=os.environ["LD_SECRET_NAME"])["SecretString"])["sdk_key"]
+          ldclient.set_config(Config(key))
+          ld = ldclient.get()
+
+          def handler(event, context):
+              app = event.get("app_name", "unknown")
+              rev = event.get("revision", "HEAD")
+              ctx = Context.builder(app).kind("application").build()
+              ld.all_flags_state(ctx)
+              ver = ld.variation("pipeline-version", ctx, "v1")
+              name = PIPELINE_MAP.get(ver, PIPELINE_MAP["v1"])
+              print(f"ROUTER: app={app} version={ver} pipeline={name}")
+              resp = cp.start_pipeline_execution(
+                  name=name,
+                  variables=[
+                      {"name": "APP_NAME", "value": app},
+                      {"name": "PIPELINE_VERSION", "value": ver},
+                  ],
+                  clientRequestToken=f"{app}-{uuid.uuid4().hex[:12]}",
+              )
+              eid = resp["pipelineExecutionId"]
+              print(f"ROUTER: execution_id={eid}")
+              return {"statusCode": 200, "body": json.dumps({
+                  "app": app, "pipeline_version": ver,
+                  "pipeline_name": name, "execution_id": eid})}
+
+  # ===========================================================================
+  # GATE LAMBDA — Evaluates LD flag to decide skip vs proceed
+  #
+  # Used as RunOrder 1 in gated stages (SAST, SCA, ChangeApproval).
+  # Outputs gate_decision ("proceed" or "skip") via outputVariables.
+  # The StageWorker Lambda at RunOrder 2 reads this decision.
+  # ===========================================================================
+
+  GateLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-gate"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt GateLambdaRole.Arn
+      Layers:
+        - !Ref LDLayerArn
+      Environment:
+        Variables:
+          LD_SECRET_NAME: !Ref LDSecretName
+      Code:
+        ZipFile: |
+          import json, os, boto3, ldclient
+          from ldclient import Context
+          from ldclient.config import Config
+
+          ALL_STAGES = ["source","build","unit-test","sast","sca","change-approval","deploy","integration-test"]
+
+          REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+          cp = boto3.client("codepipeline", region_name=REGION)
+          sec = boto3.client("secretsmanager", region_name=REGION)
+          key = json.loads(sec.get_secret_value(SecretId=os.environ["LD_SECRET_NAME"])["SecretString"])["sdk_key"]
+          ldclient.set_config(Config(key))
+          ld = ldclient.get()
+
+          def handler(event, context):
+              job = event["CodePipeline.job"]
+              job_id = job["id"]
+              params = json.loads(job["data"]["actionConfiguration"]["configuration"]["UserParameters"])
+              stage = params["stage_name"]
+              app = params["app_name"]
+              pv = params.get("pipeline_version", "?")
+              ctx = Context.builder(app).kind("application").build()
+              ld.all_flags_state(ctx)
+              required = ld.variation("pipeline-required-stages", ctx, ALL_STAGES)
+              if stage not in required:
+                  print(f"GATE: {stage} SKIPPED for {app} (pipeline {pv})")
+                  cp.put_job_success_result(jobId=job_id,
+                      outputVariables={"gate_decision": "skip", "stage_name": stage, "pipeline_version": pv})
+                  return
+              print(f"GATE: {stage} PROCEED for {app} (pipeline {pv})")
+              cp.put_job_success_result(jobId=job_id,
+                  outputVariables={"gate_decision": "proceed", "stage_name": stage, "pipeline_version": pv})
+
+  # ===========================================================================
+  # STAGE WORKER LAMBDA — Executes stage work (or no-ops if gate said skip)
+  #
+  # Used in two modes:
+  #   1. RunOrder 2 in gated stages — reads gate_decision from UserParameters
+  #   2. Single action in non-gated stages — always proceeds
+  #
+  # In production, this Lambda would call real tools (Semgrep, Snyk,
+  # ServiceNow, CodeBuild, etc.) or use continuation tokens for async work.
+  # For the PoC, it logs placeholder output.
+  # ===========================================================================
+
+  StageWorkerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-worker"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt GateLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json, os, time, boto3
+
+          STAGE_WORK = {
+              "build": {"tool": "Build", "action": "Compiling and packaging...", "result": "Build succeeded", "dur": 1},
+              "unit-test": {"tool": "UnitTest", "action": "Running unit tests...", "result": "47 passed, 0 failed", "dur": 1},
+              "sast": {"tool": "Semgrep", "action": "Running SAST scan...", "result": "0 critical findings, 2 informational", "dur": 2},
+              "sca": {"tool": "Snyk", "action": "Running dependency scan (FDA compliance)...", "result": "All clear (SBOM generated)", "dur": 2},
+              "change-approval": {"tool": "ServiceNow", "action": "Recording GxP change approval...", "result": "CR-2024-0042 auto-approved (21 CFR Part 11)", "dur": 1},
+              "deploy": {"tool": "Deploy", "action": "Deploying to target...", "result": "Health checks passing", "dur": 1},
+              "integration-test": {"tool": "IntegrationTest", "action": "Running integration tests...", "result": "12 passed, 0 failed", "dur": 1},
+          }
+
+          REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+          cp = boto3.client("codepipeline", region_name=REGION)
+
+          def handler(event, context):
+              job = event["CodePipeline.job"]
+              job_id = job["id"]
+              params = json.loads(job["data"]["actionConfiguration"]["configuration"]["UserParameters"])
+              stage = params["stage_name"]
+              app = params.get("app_name", "?")
+              pv = params.get("pipeline_version", "?")
+              gate = params.get("gate_decision", "proceed")
+
+              if gate == "skip":
+                  print(f"WORKER: {stage} skipped by gate (app={app} pipeline={pv})")
+                  cp.put_job_success_result(jobId=job_id,
+                      outputVariables={"gate_result": "skipped", "stage_name": stage, "pipeline_version": pv})
+                  return
+
+              print(f"WORKER: {stage} executing (app={app} pipeline={pv})")
+              w = STAGE_WORK.get(stage, {"tool": "generic", "action": f"Running {stage}...", "result": "OK", "dur": 1})
+              print(f"  [{w['tool']}] {w['action']}")
+              time.sleep(w["dur"])
+              print(f"  [{w['tool']}] {w['result']}")
+              cp.put_job_success_result(jobId=job_id,
+                  outputVariables={"gate_result": "executed", "stage_name": stage, "pipeline_version": pv,
+                                   "tool": w["tool"], "result": w["result"]})
+
+  # ===========================================================================
+  # CODEPIPELINE V1 — Stable pipeline
+  # ===========================================================================
+
+  SharedPipelineV1:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${AWS::StackName}-v1"
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      PipelineType: V2
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Variables:
+        - Name: APP_NAME
+          Description: The application being built (set by Router Lambda)
+        - Name: PIPELINE_VERSION
+          Description: Pipeline version v1 or v2 (set by Router Lambda)
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: S3Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: "1"
+              Configuration:
+                S3Bucket: !Ref ArtifactBucket
+                S3ObjectKey: source/app.zip
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceOutput
+
+        # --- Non-gated stages: single StageWorker action (always proceeds) ---
+
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: "1"
+              Configuration:
+                FunctionName: !Ref StageWorkerLambda
+                UserParameters: !Sub '{"stage_name": "build", "app_name": "#{variables.APP_NAME}", "pipeline_version": "#{variables.PIPELINE_VERSION}"}'
+
+        - Name: UnitTest
+          Actions:
+            - Name: UnitTestAction
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: "1"
+              Configuration:
+                FunctionName: !Ref StageWorkerLambda
+                UserParameters: !Sub '{"stage_name": "unit-test", "app_name": "#{variables.APP_NAME}", "pipeline_version": "#{variables.PIPELINE_VERSION}"}'
+
+        # --- Gated stages: Gate Lambda (RunOrder 1) → StageWorker (RunOrder 2) ---
+        #
+        # The Gate Lambda evaluates the LD flag and outputs gate_decision.
+        # The StageWorker reads gate_decision and either executes or no-ops.
+        # In production, the StageWorker would call real tools (Semgrep, Snyk, etc.).
+
+        - Name: SAST
+          Actions:
+            - Name: SASTGate
+              RunOrder: 1
+              Namespace: SASTGateNS
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: "1"
+              Configuration:
+                FunctionName: !Ref GateLambda
+                UserParameters: !Sub '{"stage_name": "sast", "app_name": "#{variables.APP_NAME}", "pipeline_version": "#{variables.PIPELINE_VERSION}"}'
+            - Name: SASTWork
+              RunOrder: 2
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: "1"
+              Configuration:
+                FunctionName: !Ref StageWorkerLambda
+                UserParameters: !Sub '{"stage_name": "sast", "app_name": "#{variables.APP_NAME}", "pipeline_version": "#{variables.PIPELINE_VERSION}", "gate_decision": "#{SASTGateNS.gate_decision}"}'
+
+        - Name: SCA
+          Actions:
+            - Name: SCAGate
+              RunOrder: 1
+              Namespace: SCAGateNS
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: "1"
+              Configuration:
+                FunctionName: !Ref GateLambda
+                UserParameters: !Sub '{"stage_name": "sca", "app_name": "#{variables.APP_NAME}", "pipeline_version": "#{variables.PIPELINE_VERSION}"}'
+            - Name: SCAWork
+              RunOrder: 2
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: "1"
+              Configuration:
+                FunctionName: !Ref StageWorkerLambda
+                UserParameters: !Sub '{"stage_name": "sca", "app_name": "#{variables.APP_NAME}", "pipeline_version": "#{variables.PIPELINE_VERSION}", "gate_decision": "#{SCAGateNS.gate_decision}"}'
+
+        - Name: ChangeApproval
+          Actions:
+            - Name: ChangeApprovalGate
+              RunOrder: 1
+              Namespace: ChangeApprovalGateNS
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: "1"
+              Configuration:
+                FunctionName: !Ref GateLambda
+                UserParameters: !Sub '{"stage_name": "change-approval", "app_name": "#{variables.APP_NAME}", "pipeline_version": "#{variables.PIPELINE_VERSION}"}'
+            - Name: ChangeApprovalWork
+              RunOrder: 2
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: "1"
+              Configuration:
+                FunctionName: !Ref StageWorkerLambda
+                UserParameters: !Sub '{"stage_name": "change-approval", "app_name": "#{variables.APP_NAME}", "pipeline_version": "#{variables.PIPELINE_VERSION}", "gate_decision": "#{ChangeApprovalGateNS.gate_decision}"}'
+
+        # --- Non-gated stages (continued) ---
+
+        - Name: Deploy
+          Actions:
+            - Name: DeployAction
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: "1"
+              Configuration:
+                FunctionName: !Ref StageWorkerLambda
+                UserParameters: !Sub '{"stage_name": "deploy", "app_name": "#{variables.APP_NAME}", "pipeline_version": "#{variables.PIPELINE_VERSION}"}'
+
+        - Name: IntegrationTest
+          Actions:
+            - Name: IntegrationTestAction
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: "1"
+              Configuration:
+                FunctionName: !Ref StageWorkerLambda
+                UserParameters: !Sub '{"stage_name": "integration-test", "app_name": "#{variables.APP_NAME}", "pipeline_version": "#{variables.PIPELINE_VERSION}"}'
+
+  # ===========================================================================
+  # CODEPIPELINE V2 — Patched pipeline (identical structure, different name)
+  # ===========================================================================
+
+  SharedPipelineV2:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${AWS::StackName}-v2"
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      PipelineType: V2
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Variables:
+        - Name: APP_NAME
+          Description: The application being built (set by Router Lambda)
+        - Name: PIPELINE_VERSION
+          Description: Pipeline version v1 or v2 (set by Router Lambda)
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: S3Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: "1"
+              Configuration:
+                S3Bucket: !Ref ArtifactBucket
+                S3ObjectKey: source/app.zip
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceOutput
+
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: "1"
+              Configuration:
+                FunctionName: !Ref StageWorkerLambda
+                UserParameters: !Sub '{"stage_name": "build", "app_name": "#{variables.APP_NAME}", "pipeline_version": "#{variables.PIPELINE_VERSION}"}'
+
+        - Name: UnitTest
+          Actions:
+            - Name: UnitTestAction
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: "1"
+              Configuration:
+                FunctionName: !Ref StageWorkerLambda
+                UserParameters: !Sub '{"stage_name": "unit-test", "app_name": "#{variables.APP_NAME}", "pipeline_version": "#{variables.PIPELINE_VERSION}"}'
+
+        - Name: SAST
+          Actions:
+            - Name: SASTGate
+              RunOrder: 1
+              Namespace: SASTGateNS
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: "1"
+              Configuration:
+                FunctionName: !Ref GateLambda
+                UserParameters: !Sub '{"stage_name": "sast", "app_name": "#{variables.APP_NAME}", "pipeline_version": "#{variables.PIPELINE_VERSION}"}'
+            - Name: SASTWork
+              RunOrder: 2
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: "1"
+              Configuration:
+                FunctionName: !Ref StageWorkerLambda
+                UserParameters: !Sub '{"stage_name": "sast", "app_name": "#{variables.APP_NAME}", "pipeline_version": "#{variables.PIPELINE_VERSION}", "gate_decision": "#{SASTGateNS.gate_decision}"}'
+
+        - Name: SCA
+          Actions:
+            - Name: SCAGate
+              RunOrder: 1
+              Namespace: SCAGateNS
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: "1"
+              Configuration:
+                FunctionName: !Ref GateLambda
+                UserParameters: !Sub '{"stage_name": "sca", "app_name": "#{variables.APP_NAME}", "pipeline_version": "#{variables.PIPELINE_VERSION}"}'
+            - Name: SCAWork
+              RunOrder: 2
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: "1"
+              Configuration:
+                FunctionName: !Ref StageWorkerLambda
+                UserParameters: !Sub '{"stage_name": "sca", "app_name": "#{variables.APP_NAME}", "pipeline_version": "#{variables.PIPELINE_VERSION}", "gate_decision": "#{SCAGateNS.gate_decision}"}'
+
+        - Name: ChangeApproval
+          Actions:
+            - Name: ChangeApprovalGate
+              RunOrder: 1
+              Namespace: ChangeApprovalGateNS
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: "1"
+              Configuration:
+                FunctionName: !Ref GateLambda
+                UserParameters: !Sub '{"stage_name": "change-approval", "app_name": "#{variables.APP_NAME}", "pipeline_version": "#{variables.PIPELINE_VERSION}"}'
+            - Name: ChangeApprovalWork
+              RunOrder: 2
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: "1"
+              Configuration:
+                FunctionName: !Ref StageWorkerLambda
+                UserParameters: !Sub '{"stage_name": "change-approval", "app_name": "#{variables.APP_NAME}", "pipeline_version": "#{variables.PIPELINE_VERSION}", "gate_decision": "#{ChangeApprovalGateNS.gate_decision}"}'
+
+        - Name: Deploy
+          Actions:
+            - Name: DeployAction
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: "1"
+              Configuration:
+                FunctionName: !Ref StageWorkerLambda
+                UserParameters: !Sub '{"stage_name": "deploy", "app_name": "#{variables.APP_NAME}", "pipeline_version": "#{variables.PIPELINE_VERSION}"}'
+
+        - Name: IntegrationTest
+          Actions:
+            - Name: IntegrationTestAction
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: "1"
+              Configuration:
+                FunctionName: !Ref StageWorkerLambda
+                UserParameters: !Sub '{"stage_name": "integration-test", "app_name": "#{variables.APP_NAME}", "pipeline_version": "#{variables.PIPELINE_VERSION}"}'
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  RouterLambdaArn:
+    Description: ARN of the Router Lambda
+    Value: !GetAtt RouterLambda.Arn
+
+  RouterLambdaName:
+    Description: Name of the Router Lambda (for aws lambda invoke)
+    Value: !Ref RouterLambda
+
+  GateLambdaArn:
+    Description: ARN of the Gate Lambda
+    Value: !GetAtt GateLambda.Arn
+
+  ArtifactBucketName:
+    Description: S3 bucket for pipeline artifacts
+    Value: !Ref ArtifactBucket
+
+  PipelineV1Name:
+    Description: Stable pipeline name
+    Value: !Ref SharedPipelineV1
+
+  PipelineV2Name:
+    Description: Patched pipeline name
+    Value: !Ref SharedPipelineV2
+
+  PipelineV1Url:
+    Description: Console URL for pipeline V1
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${AWS::StackName}-v1/view"
+
+  PipelineV2Url:
+    Description: Console URL for pipeline V2
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${AWS::StackName}-v2/view"
