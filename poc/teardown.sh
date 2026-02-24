@@ -8,6 +8,13 @@
 #
 set -euo pipefail
 
+# Source .env from repo root if it exists
+if [[ -f "$(dirname "$0")/../.env" ]]; then
+  set -a
+  source "$(dirname "$0")/../.env"
+  set +a
+fi
+
 if [ -z "${AWS_PROFILE:-}" ]; then
   echo "ERROR: AWS_PROFILE is not set. Export it or add it to .env"
   exit 1
@@ -24,21 +31,31 @@ echo ""
 # -----------------------------------------------------------------
 # Step 1: Get and empty the artifact bucket
 # -----------------------------------------------------------------
-BUCKET=$(aws cloudformation describe-stacks \
+BUCKET_RESULT=$(aws cloudformation describe-stacks \
   --stack-name "$STACK_NAME" \
   --region "$REGION" \
   --query "Stacks[0].Outputs[?OutputKey=='ArtifactBucketName'].OutputValue" \
-  --output text 2>/dev/null || echo "")
+  --output text 2>&1) && BUCKET="$BUCKET_RESULT" || {
+  echo "  WARNING: Could not describe stack '$STACK_NAME': $BUCKET_RESULT"
+  echo "  Stack may not exist or may already be deleted. Attempting cleanup anyway."
+  BUCKET=""
+}
 
 if [ -n "$BUCKET" ] && [ "$BUCKET" != "None" ]; then
   echo "--- Emptying S3 bucket: $BUCKET ---"
 
   # Delete all object versions (required for versioned buckets)
-  aws s3api list-object-versions \
+  VERSIONS_JSON=$(aws s3api list-object-versions \
     --bucket "$BUCKET" \
     --region "$REGION" \
-    --output json 2>/dev/null | \
-  python3 -c "
+    --output json 2>&1) || {
+    echo "  WARNING: Could not list object versions for '$BUCKET': $VERSIONS_JSON"
+    echo "  Bucket may already be empty or deleted."
+    VERSIONS_JSON=""
+  }
+
+  if [ -n "$VERSIONS_JSON" ]; then
+    echo "$VERSIONS_JSON" | python3 -c "
 import json, sys, subprocess
 data = json.load(sys.stdin)
 objects = []
@@ -51,16 +68,19 @@ if objects:
     for i in range(0, len(objects), 1000):
         batch = objects[i:i+1000]
         delete_json = json.dumps({'Objects': batch, 'Quiet': True})
-        subprocess.run([
+        r = subprocess.run([
             'aws', 's3api', 'delete-objects',
             '--bucket', '$BUCKET',
             '--region', '$REGION',
             '--delete', delete_json,
-        ], check=True, capture_output=True)
+        ], capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f'  WARNING: delete-objects failed: {r.stderr.strip()}', file=sys.stderr)
     print(f'  Deleted {len(objects)} object versions')
 else:
     print('  Bucket already empty')
-" 2>/dev/null || echo "  Warning: could not empty bucket (may already be empty)"
+" || echo "  WARNING: Failed to empty bucket '$BUCKET'"
+  fi
   echo ""
 fi
 
@@ -68,14 +88,25 @@ fi
 # Step 2: Delete the CloudFormation stack
 # -----------------------------------------------------------------
 echo "--- Deleting CloudFormation stack ---"
-aws cloudformation delete-stack \
+if ! aws cloudformation delete-stack \
   --stack-name "$STACK_NAME" \
-  --region "$REGION"
+  --region "$REGION"; then
+  echo "ERROR: Failed to initiate stack deletion for '$STACK_NAME'"
+  exit 1
+fi
 
 echo "  Waiting for stack deletion..."
-aws cloudformation wait stack-delete-complete \
+if ! aws cloudformation wait stack-delete-complete \
   --stack-name "$STACK_NAME" \
-  --region "$REGION" 2>/dev/null || true
+  --region "$REGION" 2>&1; then
+  echo "ERROR: Stack deletion failed or timed out. Check the AWS console for details:"
+  aws cloudformation describe-stack-events \
+    --stack-name "$STACK_NAME" \
+    --region "$REGION" \
+    --query "StackEvents[?ResourceStatus=='DELETE_FAILED'].[LogicalResourceId,ResourceStatusReason]" \
+    --output table 2>/dev/null || true
+  exit 1
+fi
 
 echo "  Stack deleted."
 echo ""
@@ -84,12 +115,18 @@ echo ""
 # Step 3: Delete the LD secret (if it exists)
 # -----------------------------------------------------------------
 echo "--- Cleaning up Secrets Manager ---"
-aws secretsmanager delete-secret \
+SECRET_RESULT=$(aws secretsmanager delete-secret \
   --secret-id "pipeline/launchdarkly-sdk-key" \
   --force-delete-without-recovery \
-  --region "$REGION" 2>/dev/null \
+  --region "$REGION" 2>&1) \
   && echo "  Deleted pipeline/launchdarkly-sdk-key" \
-  || echo "  No LD secret found (already deleted or never created)"
+  || {
+    if echo "$SECRET_RESULT" | grep -q "ResourceNotFoundException"; then
+      echo "  No LD secret found (already deleted or never created)"
+    else
+      echo "  WARNING: Failed to delete secret: $SECRET_RESULT"
+    fi
+  }
 
 echo ""
 echo "============================================================"

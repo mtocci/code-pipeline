@@ -9,6 +9,13 @@
 #
 set -euo pipefail
 
+# Source .env from repo root if it exists
+if [[ -f "$(dirname "$0")/../.env" ]]; then
+  set -a
+  source "$(dirname "$0")/../.env"
+  set +a
+fi
+
 if [ -z "${AWS_PROFILE:-}" ]; then
   echo "ERROR: AWS_PROFILE is not set. Export it or add it to .env"
   exit 1
@@ -21,7 +28,11 @@ ROUTER_NAME=$(aws cloudformation describe-stacks \
   --stack-name "$STACK_NAME" \
   --region "$REGION" \
   --query "Stacks[0].Outputs[?OutputKey=='RouterLambdaName'].OutputValue" \
-  --output text 2>/dev/null)
+  --output text 2>&1) || {
+  echo "ERROR: Failed to describe stack '$STACK_NAME': $ROUTER_NAME"
+  echo "Run ./setup.sh first."
+  exit 1
+}
 
 if [ -z "$ROUTER_NAME" ] || [ "$ROUTER_NAME" = "None" ]; then
   echo "ERROR: Could not find Router Lambda in stack '$STACK_NAME'."
@@ -35,19 +46,36 @@ fi
 invoke_router() {
   local app_name="$1"
   local revision="${2:-$(openssl rand -hex 4)}"
-  local tmpfile
+  local tmpfile invoke_meta
   tmpfile=$(mktemp)
+  invoke_meta=$(mktemp)
 
   local payload
   payload=$(printf '{"app_name": "%s", "revision": "%s"}' "$app_name" "$revision")
 
-  aws lambda invoke \
+  if ! aws lambda invoke \
     --function-name "$ROUTER_NAME" \
     --payload "$payload" \
     --region "$REGION" \
     --cli-binary-format raw-in-base64-out \
-    "$tmpfile" > /dev/null 2>&1
+    "$tmpfile" > "$invoke_meta" 2>&1; then
+    echo "ERROR: Lambda invoke failed:" >&2
+    cat "$invoke_meta" >&2
+    rm -f "$tmpfile" "$invoke_meta"
+    return 1
+  fi
 
+  # Check for Lambda execution errors (FunctionError field in metadata)
+  if grep -q '"FunctionError"' "$invoke_meta" 2>/dev/null; then
+    echo "ERROR: Lambda returned an error:" >&2
+    cat "$invoke_meta" >&2
+    echo "Lambda response:" >&2
+    cat "$tmpfile" >&2
+    rm -f "$tmpfile" "$invoke_meta"
+    return 1
+  fi
+
+  rm -f "$invoke_meta"
   cat "$tmpfile"
   rm -f "$tmpfile"
 }
@@ -70,7 +98,10 @@ region = os.environ["_REGION"]
 STAGE_ORDER = ["Source", "Build", "UnitTest", "SAST", "SCA", "ChangeApproval", "Deploy", "IntegrationTest"]
 GATED_STAGES = {"SAST", "SCA", "ChangeApproval"}
 
+api_errors = 0
+
 def get_execution_status():
+    global api_errors
     r = subprocess.run([
         "aws", "codepipeline", "get-pipeline-execution",
         "--pipeline-name", pipeline_name,
@@ -78,10 +109,17 @@ def get_execution_status():
         "--region", region, "--output", "json",
     ], capture_output=True, text=True)
     if r.returncode != 0:
+        api_errors += 1
+        print(f"  WARNING: get-pipeline-execution failed: {r.stderr.strip()}", file=sys.stderr, flush=True)
+        if api_errors >= 5:
+            print(f"  ERROR: Too many API failures, aborting", file=sys.stderr, flush=True)
+            sys.exit(1)
         return "Unknown"
+    api_errors = 0
     return json.loads(r.stdout).get("pipelineExecution", {}).get("status", "Unknown")
 
 def get_actions():
+    global api_errors
     r = subprocess.run([
         "aws", "codepipeline", "list-action-executions",
         "--pipeline-name", pipeline_name,
@@ -89,6 +127,11 @@ def get_actions():
         "--region", region, "--output", "json",
     ], capture_output=True, text=True)
     if r.returncode != 0:
+        api_errors += 1
+        print(f"  WARNING: list-action-executions failed: {r.stderr.strip()}", file=sys.stderr, flush=True)
+        if api_errors >= 5:
+            print(f"  ERROR: Too many API failures, aborting", file=sys.stderr, flush=True)
+            sys.exit(1)
         return {}
     actions = {}
     for a in json.loads(r.stdout).get("actionExecutionDetails", []):
@@ -271,25 +314,53 @@ run_app() {
 
   local raw_file
   raw_file=$(mktemp)
-  invoke_router "$app_name" "$revision" > "$raw_file"
+  if ! invoke_router "$app_name" "$revision" > "$raw_file"; then
+    rm -f "$raw_file"
+    echo "  FAILED: Could not invoke router for $app_name"
+    return 1
+  fi
+
+  # Check for empty response
+  if [ ! -s "$raw_file" ]; then
+    echo "  ERROR: Lambda returned empty response"
+    rm -f "$raw_file"
+    return 1
+  fi
 
   # Parse response
   local pipeline_name pipeline_version execution_id
-  eval "$(python3 -c "
+  local parse_result
+  parse_result=$(python3 -c "
 import json, sys
 with open('$raw_file') as f:
     raw = f.read()
 try:
     resp = json.loads(raw)
     body = json.loads(resp['body']) if isinstance(resp.get('body'), str) else resp
-except:
-    print('echo \"ERROR: Failed to parse Lambda response\"; exit 1')
-    sys.exit(0)
-print(f'pipeline_name=\"{body.get(\"pipeline_name\",\"\")}\"')
-print(f'pipeline_version=\"{body.get(\"pipeline_version\",\"\")}\"')
-print(f'execution_id=\"{body.get(\"execution_id\",\"\")}\"')
-")"
+except Exception as e:
+    print(f'PARSE_ERROR: {e}', file=sys.stderr)
+    print(f'Raw response: {raw[:500]}', file=sys.stderr)
+    sys.exit(1)
 
+pn = body.get('pipeline_name', '')
+pv = body.get('pipeline_version', '')
+eid = body.get('execution_id', '')
+
+if not pn or not eid:
+    print(f'PARSE_ERROR: Missing pipeline_name or execution_id in response: {body}', file=sys.stderr)
+    sys.exit(1)
+
+print(f'pipeline_name=\"{pn}\"')
+print(f'pipeline_version=\"{pv}\"')
+print(f'execution_id=\"{eid}\"')
+") || {
+    echo "  ERROR: Failed to parse Lambda response"
+    echo "  Raw response: $(cat "$raw_file")"
+    rm -f "$raw_file"
+    return 1
+  }
+
+  eval "$parse_result"
   rm -f "$raw_file"
 
   echo "  Routed to: $pipeline_name ($pipeline_version)"

@@ -14,6 +14,13 @@
 #
 set -euo pipefail
 
+# Source .env from repo root if it exists
+if [[ -f "$(dirname "$0")/../.env" ]]; then
+  set -a
+  source "$(dirname "$0")/../.env"
+  set +a
+fi
+
 if [ -z "${AWS_PROFILE:-}" ]; then
   echo "ERROR: AWS_PROFILE is not set. Export it or add it to .env"
   exit 1
@@ -75,17 +82,25 @@ echo ""
 # Step 1: Store LD SDK key in Secrets Manager
 # -----------------------------------------------------------------
 echo "--- Storing LD SDK key in Secrets Manager ---"
-aws secretsmanager create-secret \
-  --name "$LD_SECRET_NAME" \
-  --secret-string "{\"sdk_key\": \"${LD_SDK_KEY}\"}" \
-  --region "$REGION" \
-  --output text --query 'ARN' 2>/dev/null \
-|| \
-aws secretsmanager update-secret \
-  --secret-id "$LD_SECRET_NAME" \
-  --secret-string "{\"sdk_key\": \"${LD_SDK_KEY}\"}" \
-  --region "$REGION" \
-  --output text --query 'ARN'
+if aws secretsmanager describe-secret --secret-id "$LD_SECRET_NAME" --region "$REGION" > /dev/null 2>&1; then
+  if ! aws secretsmanager update-secret \
+    --secret-id "$LD_SECRET_NAME" \
+    --secret-string "{\"sdk_key\": \"${LD_SDK_KEY}\"}" \
+    --region "$REGION" \
+    --output text --query 'ARN'; then
+    echo "ERROR: Failed to update secret '$LD_SECRET_NAME'"
+    exit 1
+  fi
+else
+  if ! aws secretsmanager create-secret \
+    --name "$LD_SECRET_NAME" \
+    --secret-string "{\"sdk_key\": \"${LD_SDK_KEY}\"}" \
+    --region "$REGION" \
+    --output text --query 'ARN'; then
+    echo "ERROR: Failed to create secret '$LD_SECRET_NAME'"
+    exit 1
+  fi
+fi
 echo "  Done."
 echo ""
 
@@ -96,7 +111,7 @@ echo "--- Deploying CloudFormation stack ---"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-aws cloudformation deploy \
+if ! aws cloudformation deploy \
   --template-file "$SCRIPT_DIR/../pipeline-router-stack.yaml" \
   --stack-name "$STACK_NAME" \
   --parameter-overrides \
@@ -104,7 +119,16 @@ aws cloudformation deploy \
     LDSecretName="${LD_SECRET_NAME}" \
   --capabilities CAPABILITY_NAMED_IAM \
   --region "$REGION" \
-  --no-fail-on-empty-changeset
+  --no-fail-on-empty-changeset; then
+  echo ""
+  echo "ERROR: CloudFormation deploy failed. Stack events:"
+  aws cloudformation describe-stack-events \
+    --stack-name "$STACK_NAME" \
+    --region "$REGION" \
+    --query "StackEvents[?ResourceStatus=='CREATE_FAILED' || ResourceStatus=='UPDATE_FAILED'].[LogicalResourceId,ResourceStatusReason]" \
+    --output table 2>/dev/null || true
+  exit 1
+fi
 
 echo "  Stack deployed."
 echo ""
@@ -114,29 +138,35 @@ echo ""
 # -----------------------------------------------------------------
 echo "--- Retrieving stack outputs ---"
 
-BUCKET=$(aws cloudformation describe-stacks \
+STACK_OUTPUT=$(aws cloudformation describe-stacks \
   --stack-name "$STACK_NAME" \
   --region "$REGION" \
-  --query "Stacks[0].Outputs[?OutputKey=='ArtifactBucketName'].OutputValue" \
-  --output text)
+  --query "Stacks[0].Outputs" \
+  --output json) || { echo "ERROR: Failed to retrieve stack outputs"; exit 1; }
 
-ROUTER_NAME=$(aws cloudformation describe-stacks \
-  --stack-name "$STACK_NAME" \
-  --region "$REGION" \
-  --query "Stacks[0].Outputs[?OutputKey=='RouterLambdaName'].OutputValue" \
-  --output text)
+get_output() {
+  echo "$STACK_OUTPUT" | python3 -c "
+import json, sys
+outputs = json.load(sys.stdin)
+for o in outputs:
+    if o['OutputKey'] == '$1':
+        print(o['OutputValue'])
+        sys.exit(0)
+print('')
+"
+}
 
-V1_URL=$(aws cloudformation describe-stacks \
-  --stack-name "$STACK_NAME" \
-  --region "$REGION" \
-  --query "Stacks[0].Outputs[?OutputKey=='PipelineV1Url'].OutputValue" \
-  --output text)
+BUCKET=$(get_output ArtifactBucketName)
+ROUTER_NAME=$(get_output RouterLambdaName)
+V1_URL=$(get_output PipelineV1Url)
+V2_URL=$(get_output PipelineV2Url)
 
-V2_URL=$(aws cloudformation describe-stacks \
-  --stack-name "$STACK_NAME" \
-  --region "$REGION" \
-  --query "Stacks[0].Outputs[?OutputKey=='PipelineV2Url'].OutputValue" \
-  --output text)
+for var_name in BUCKET ROUTER_NAME V1_URL V2_URL; do
+  if [ -z "${!var_name}" ]; then
+    echo "ERROR: Stack output '$var_name' is empty. Stack may not have deployed correctly."
+    exit 1
+  fi
+done
 
 echo "  Artifact bucket: $BUCKET"
 echo "  Router Lambda:   $ROUTER_NAME"
@@ -150,9 +180,17 @@ echo "--- Uploading placeholder source artifact ---"
 TMPDIR=$(mktemp -d)
 echo '{"app": "placeholder", "version": "1.0.0"}' > "$TMPDIR/buildspec.yml"
 echo 'print("hello world")' > "$TMPDIR/app.py"
-(cd "$TMPDIR" && zip -q app.zip buildspec.yml app.py)
+if ! (cd "$TMPDIR" && zip -q app.zip buildspec.yml app.py); then
+  echo "ERROR: Failed to create source artifact zip"
+  rm -rf "$TMPDIR"
+  exit 1
+fi
 
-aws s3 cp "$TMPDIR/app.zip" "s3://$BUCKET/source/app.zip" --region "$REGION"
+if ! aws s3 cp "$TMPDIR/app.zip" "s3://$BUCKET/source/app.zip" --region "$REGION"; then
+  echo "ERROR: Failed to upload source artifact to s3://$BUCKET/source/app.zip"
+  rm -rf "$TMPDIR"
+  exit 1
+fi
 rm -rf "$TMPDIR"
 
 echo "  Uploaded s3://$BUCKET/source/app.zip"
